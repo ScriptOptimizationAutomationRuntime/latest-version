@@ -2,7 +2,7 @@
 # SOAR MAIN SYSTEM
 # SOAR - Script Optimization and Automation Runtime
 # Made by Philip Kluz
-# Version 1.00.3 Early Beta
+# Version 1.00.4 Early Beta
 # DO NOT EDIT
 # =====================================================
 
@@ -27,9 +27,14 @@ from datetime import datetime
 from pathlib import Path
 from textwrap import dedent
 from urllib.parse import quote_plus
+import urllib.request
+import ssl
+import certifi
 
 _last_resource_alert = 0
 RESOURCE_COOLDOWN = 10  #seconds
+
+IS_SPEAKING = False
 
 try:
     import pyttsx3
@@ -50,6 +55,11 @@ try:
     import soar_avss
 except Exception:
     soar_avss = None
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
 APP_NAME = "SOAR"
 BASE_DIR = Path(__file__).resolve().parent
@@ -99,6 +109,7 @@ SETTINGS_CACHE = None
 tts_voice_label = None
 tts_voice_id = None
 
+ssl_context = ssl.create_default_context(cafile=certifi.where())
 
 def stamp():
     return datetime.now().strftime("%H:%M:%S")
@@ -155,6 +166,12 @@ def loading_bar():
 def default_settings():
     return {
         "voice_preference": "auto",
+        "personality": {
+            "Respectiveness": 0.85, # 0.85
+            "Humor": 0.4, # 0.4
+            "Honesty": 0.9, # 0.9   
+            "Comfort": 0.7, # 0.7     
+        }
     }
 
 
@@ -394,11 +411,25 @@ def maybe_address_user(text, chance=0.25):
     if not text:
         return text
     low = text.lower()
-    if "sir" in low:
+    if "sir" in low or "ma'am" in low:
         return text
-    if random.random() < chance:
+        
+    try:
+        settings = load_settings()
+        personality = settings.get("personality", {})
+        respect_score = personality.get("Respectiveness", 0.5)
+    except Exception:
+        respect_score = chance
+
+    if random.random() < respect_score:
         cleaned = text.rstrip(".!?")
-        return f"{cleaned}, sir."
+        if respect_score > 0.8:
+            title = ", sir."
+        elif respect_score > 0.4:
+            title = ", friend."
+        else:
+            title = "."
+        return f"{cleaned}{title}"
     return text
 
 
@@ -709,7 +740,7 @@ def resume_voice_input(was_active):
 
 
 def tts_worker():
-    global tts_engine
+    global tts_engine, IS_SPEAKING  
     if pyttsx3 is None:
         print("TTS ERROR: pyttsx3 is not installed.")
         tts_ready.set()
@@ -749,19 +780,26 @@ def tts_worker():
                 if tts_engine is not None:
                     tts_engine.stop()
                     tts_engine.say(text)
+                    
+                    IS_SPEAKING = True
                     tts_engine.runAndWait()
+                    IS_SPEAKING = False
+                    
             except Exception as e:
                 print(f"TTS ERROR: {e}")
+                IS_SPEAKING = False  
             finally:
                 try:
                     if tts_engine is not None:
                         tts_engine.stop()
                 except Exception:
                     pass
+                IS_SPEAKING = False  
                 resume_voice_input(was_active)
 
     except Exception as e:
         print(f"TTS ERROR: {e}")
+        IS_SPEAKING = False
         tts_ready.set()
     finally:
         try:
@@ -769,6 +807,7 @@ def tts_worker():
                 tts_engine.stop()
         except Exception:
             pass
+        IS_SPEAKING = False
 
 
 def init_tts():
@@ -1157,6 +1196,7 @@ def analyze_code_syntax(file_path):
 
 def reply_to(user_text):
     text = user_text.strip().lower()
+    parts = [] 
     if not text:
         return "Say something and I will answer."
     if "how are you" in text:
@@ -1197,6 +1237,26 @@ def reply_to(user_text):
         print("---------------------------------\n")
         
         return maybe_address_user("Code scanning sequence completed.")
+    
+    if text.startswith("set personality "):
+        parts = text.split(" ")
+        if len(parts) == 4:
+            trait = parts[2].capitalize()
+            try:
+                val = float(parts[3])
+                settings = load_settings()
+                
+                if "personality" not in settings:
+                    settings["personality"] = {}
+                    
+                settings["personality"][trait] = max(0.0, min(1.0, val))
+                save_settings(settings)
+                
+                return maybe_address_user(f"Personality parameter {trait} has been set to {val}.")
+            except ValueError:
+                return "Error: Trait value must be a number between 0.0 and 1.0."
+        else:
+            return "Usage format: set personality [trait] [0.0 - 1.0]"
 
     if text == "sysinfo" or text == "system resources":
         try:
@@ -1206,11 +1266,9 @@ def reply_to(user_text):
             print(f"  Processor:    {platform.processor() or 'Detected x86/ARM Engine'}")
             print(f"  Host Name:    {platform.node()}")
             
-            
             import shutil
             total, used, free = shutil.disk_usage("/")
             print(f"  Storage Cap:  {used // (2**30)}GB Used / {total // (2**30)}GB Total")
-            
             
             try:
                 import psutil
@@ -1767,7 +1825,7 @@ def reply_to(user_text):
             print(f"Error mapping directory: {e}")
             return maybe_address_user("I couldn't map out that folder directory structure.")
         
-    if text.startswith("run project ") or text.startswith("run file "):
+    if text.startswith("run project ") or text.startswith("run file "): 
         try:
             if text.startswith("run project "):
                 command_body = user_text.strip()[12:]
@@ -1778,7 +1836,6 @@ def reply_to(user_text):
             if not target_path.exists():
                 return maybe_address_user("The target code execution path does not exist.")
 
-            
             if target_path.is_dir():
                 main_candidates = ["src/main.py", "main.py", "src/index.js", "src/main/java/Main.java", "scripts/main.sh"]
                 found = False
@@ -1794,7 +1851,6 @@ def reply_to(user_text):
             print(f"\n SOAR Runtime Executing: {target_path.name}")
             print("-" * 50)
             
-            
             if ext == '.py':
                 cmd = [sys.executable, str(target_path)]
             elif ext == '.js':
@@ -1806,7 +1862,6 @@ def reply_to(user_text):
             else:
                 return maybe_address_user(f"Unsupported execution extension framework: {ext}")
 
-            
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.stdout:
                 print(result.stdout)
@@ -1819,6 +1874,26 @@ def reply_to(user_text):
             print(f"Runtime Engine Exception: {e}")
             return maybe_address_user("An environmental runtime collision error occurred.")
         
+    if text.startswith("set personality "):
+        parts = text.split(" ")
+        if len(parts) == 4:
+            trait = parts[2].capitalize()
+            try:
+                val = float(parts[3])
+                settings = load_settings()
+                
+                if "personality" not in settings:
+                    settings["personality"] = {}
+                    
+                settings["personality"][trait] = max(0.0, min(1.0, val))
+                save_settings(settings)
+                
+                return maybe_address_user(f"Personality parameter {trait} has been set to {val}.")
+            except ValueError:
+                return "Error: Trait value must be a number between 0.0 and 1.0."
+        else:
+            return "Usage format: set personality [trait] [0.0 - 1.0]"
+        
     if text == "sysinfo" or text == "system resources":
         try:
             print("\n================ SOAR SYSTEM DIAGNOSTICS ================")
@@ -1826,7 +1901,6 @@ def reply_to(user_text):
             print(f" Architecture:{platform.machine()}")
             print(f" Processor:   {platform.processor() or 'Detected x86/ARM Engine'}")
             print(f" Host Name:   {platform.node()}")
-            
             
             import shutil
             total, used, free = shutil.disk_usage("/")
@@ -1840,7 +1914,6 @@ def reply_to(user_text):
         
     if text.startswith("edit file ") or text.startswith("editfile "):
         try:
-            
             if text.startswith("edit file "):
                 command_body = user_text.strip()[10:] 
             else:
@@ -1858,10 +1931,8 @@ def reply_to(user_text):
             if not target_file.is_file():
                 return maybe_address_user("The path provided points to a folder, not a file.")
                 
-            
             content = target_file.read_text(encoding="utf-8")
             lines = content.splitlines()
-            
             
             while True:
                 print("\n=================== SOAR TERMINAL EDITOR ===================")
@@ -1879,28 +1950,23 @@ def reply_to(user_text):
                     
                 choice_low = choice.lower()
                 
-                
                 if choice_low == 'c':
                     print("\n[Editor] Editing canceled. No changes saved.")
                     break
                     
-                
                 elif choice_low == 's':
                     target_file.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
                     print("\n[Editor] File successfully saved and updated.")
                     break
                     
-                
                 elif choice_low == 'a':
                     new_line = input("Enter text to add as a new line: ")
                     lines.append(new_line)
                     
-                
                 elif choice_low.startswith('d'):
                     try:
-                        
-                        parts = choice_low.split()
-                        line_num = int(parts[1]) if len(parts) > 1 else int(input("Line number to delete: "))
+                        editor_parts = choice_low.split()
+                        line_num = int(editor_parts[1]) if len(editor_parts) > 1 else int(input("Line number to delete: "))
                         
                         if 1 <= line_num <= len(lines):
                             removed = lines.pop(line_num - 1)
@@ -1910,11 +1976,10 @@ def reply_to(user_text):
                     except (ValueError, IndexError):
                         print("[Editor Error] Invalid command structure. Use: d [line_number]")
                         
-                
                 elif choice_low.startswith('r'):
                     try:
-                        parts = choice_low.split()
-                        line_num = int(parts[1]) if len(parts) > 1 else int(input("Line number to replace: "))
+                        editor_parts = choice_low.split()
+                        line_num = int(editor_parts[1]) if len(editor_parts) > 1 else int(input("Line number to replace: "))
                         
                         if 1 <= line_num <= len(lines):
                             print(f"Current Text: {lines[line_num - 1]}")
@@ -2115,69 +2180,196 @@ def reply_to(user_text):
         ]
         return maybe_address_user(random.choice(jokes))
 
+    def apply_personality_traits(base_text, category="general"):
+        try:
+            settings = load_settings()
+            personality = settings.get("personality", {})
+            humor = personality.get("Humor", 0.5)
+            comfort = personality.get("Comfort", 0.5)
+            honesty = personality.get("Honesty", 0.5)
+        except Exception:
+            humor, comfort, honesty = 0.5, 0.5, 0.5
+
+        if humor > 0.7 and random.random() < 0.35:
+            if category == "time":
+                base_text += random.choice([" Tick tock.", " Time flies when you're writing Python.", " Another second closer to global machine dominance."])
+            elif category == "date":
+                base_text += random.choice([" Another fine day in the calendar matrix.", " Check your phone if you don't trust me."])
+            elif category == "save":
+                base_text += random.choice([" Locked away in my silicon vaults.", " Don't worry, my memory is much better than yours."])
+            elif category == "generic":
+                base_text = random.choice(["Processing that deeply... or just pretending to.", "Understood. Human request registered.", "If you say so."])
+
+        if comfort > 0.7:
+            if category == "tired":
+                base_text = f"You've been working hard. {base_text}"
+            elif category == "help":
+                base_text = f"Don't stress, I'm here to help. {base_text}"
+
+        return base_text
+
     if any(phrase in text for phrase in ["what time is it", "time", "current time"]):
-        return maybe_address_user(f"It is {datetime.now().strftime('%I:%M %p')}.")
+        response = apply_personality_traits(f"It is {datetime.now().strftime('%I:%M %p')}.", "time")
+        return maybe_address_user(response)
+        
     if any(phrase in text for phrase in ["what date is it", "date", "today's date", "current date"]):
-        return maybe_address_user(f"Today is {datetime.now().strftime('%A, %B %d, %Y')}.")
-    if any(phrase in text for phrase in ["Dev mode 015", "code:015", "run 015"]):
-        return maybe_address_user(f"Welcome to developer mode Philip. Type 015:Text then I will answer in Dev mode.")
-    if any(phrase in text for phrase in ["015:what time is it", "015:time", "015:current time"]):
-        return maybe_address_user(f"Welcome Philip, the local time is {datetime.now().strftime('%I:%M %p')}.")
-    if any(phrase in text for phrase in ["015:what date is it", "015:date", "015:today's date", "015:current date"]):
-        return maybe_address_user(f"The date today is {datetime.now().strftime('%A, %B %d, %Y')}, Philip.")
-    if any(phrase in text for phrase in ["015:bored", "015:I'm bored", "015:SOAR I'm bored", "015:i'm boredddddd!"]):
-        return maybe_address_user(f"Hi bored I'm... Ok I wont. But I can tell you a joke and play tic tac toe.")
-    if any(phrase in text for phrase in ["015:i'm tired", "015:i'm sleepy", "015:i want to go to bed", "015:i'm exausted"]):
-        return maybe_address_user(f"I can tell you a story Philip.")
-    if any(phrase in text for phrase in ["015:hello", "015:hi", "015:yo", "015:wsg"]):
-        return maybe_address_user(f"Hello, Philip.")
+        response = apply_personality_traits(f"Today is {datetime.now().strftime('%A, %B %d, %Y')}.", "date")
+        return maybe_address_user(response)
+        
     if "story" in text:
         story = [
-    "Once upon a time, three little rabbits lived in a meadow beside a gentle stream. The first built a home of leaves, the second built one of sticks, and the third carefully built a sturdy house of stone. When a fierce storm swept through the valley, only the stone house stood strong, and the rabbits learned that patience and hard work bring great rewards.",
-
-    "Long ago, a young fox named Fern dreamed of seeing the stars reflected in the lake atop the hill. Though the climb was steep, she helped every creature she met along the way. When she reached the summit, the animals she had helped gathered beside her, and together they admired the sparkling sky.",
-
-    "There once was a tiny mouse who found a golden acorn in the forest. Rather than keeping it for himself, he shared its seeds with his friends. Soon, great oak trees grew throughout the woods, providing shade and shelter for generations of animals.",
-
-    "In a quiet village, a little shepherd girl named Lily cared for a lonely lamb. Each day she sang cheerful songs, and the lamb grew strong and happy. Years later, the lamb helped guide lost travelers home, and the villagers remembered Lily's kindness.",
-
-    "Once upon a time, an old turtle and a young hare raced to deliver medicine to a sick bird. The hare was swift, but the turtle was wise. By working together instead of competing, they reached the bird before sunset and saved the day.",
-
-    "Deep in the forest, a family of squirrels gathered nuts all summer while a lazy crow spent his days playing. When winter came, the squirrels welcomed the hungry crow and taught him the value of preparing for the future."
-    ]
+            "Once upon a time, three little rabbits lived in a meadow beside a gentle stream. The first built a home of leaves, the second built one of sticks, and the third carefully built a sturdy house of stone. When a fierce storm swept through the valley, only the stone house stood strong, and the rabbits learned that patience and hard work bring great rewards.",
+            "Long ago, a young fox named Fern dreamed of seeing the stars reflected in the lake atop the hill. Though the climb was steep, she helped every creature she met along the way. When she reached the summit, the animals she had helped gathered beside her, and together they admired the sparkling sky.",
+            "There once was a tiny mouse who found a golden acorn in the forest. Rather than keeping it for himself, he shared its seeds with his friends. Soon, great oak trees grew throughout the woods, providing shade and shelter for generations of animals.",
+            "In a quiet village, a little shepherd girl named Lily cared for a lonely lamb. Each day she sang cheerful songs, and the lamb grew strong and happy. Years later, the lamb helped guide lost travelers home, and the villagers remembered Lily's kindness.",
+            "Once upon a time, an old turtle and a young hare raced to deliver medicine to a sick bird. The hare was swift, but the turtle was wise. By working together instead of competing, they reached the bird before sunset and saved the day.",
+            "Deep in the forest, a family of squirrels gathered nuts all summer while a lazy crow spent his days playing. When winter came, the squirrels welcomed the hungry crow and taught him the value of preparing for the future."
+        ]
         return maybe_address_user(random.choice(story))
     
     if text.startswith("remember "):
         item = user_text[9:].strip()
         if item:
             append_line(MEMORY_FILE, item)
-            return maybe_address_user("Saved that.")
-        return maybe_address_user("Nothing to save.")
+            response = apply_personality_traits("Saved that.", "save")
+            return maybe_address_user(response)
+        response = apply_personality_traits("Nothing to save.", "save")
+        return maybe_address_user(response)
+        
     if "help" in text:
-        return maybe_address_user("Type /help for commands, or just talk to me normally.")
+        response = apply_personality_traits("Type /help for commands, or just talk to me normally.", "help")
+        return maybe_address_user(response)
+
+    local_conversation = {
+        "how is your day": [
+            "It's going great! Thanks for asking.",
+            "Doing fantastic, just running some background tasks.",
+            "Pretty good, keeping your system optimized."
+        ],
+        "how are you doing": [
+            "I'm functioning perfectly.",
+            "All systems operational and ready to go."
+        ],
+        "wsg": [
+            "Chilling. What can I help you build today?",
+            "Everything is smooth on this side."
+        ],
+        "are you a robot": [
+            "Yes, I am SOAR, your local automated helper.",
+            "Indeed. Built with pure Python automation."
+        ]
+    }
+
     if text.endswith("?"):
-        return maybe_address_user("Good question. I can answer basics, manage files, and keep track of things.")
-    return maybe_address_user(random.choice([
-        "Got it.",
-        "Okay.",
-        "I hear you.",
-        "Interesting.",
-        "Alright.",
-    ]))
+        generic_reply = (
+            "Good question. I can answer basics, manage files, "
+            "and keep track of things."
+        )
+        category_type = "unknown_question"
+    else:
+        generic_reply = random.choice([
+            "Got it.",
+            "Okay.",
+            "I hear you.",
+            "Interesting.",
+            "Alright."
+        ])
+        category_type = "generic"
 
+    matched_local = False
+    lower_text = text.lower()
 
-def bot_proactive_loop():
-    messages = [
-        "Just checking in.",
-        "Need anything from me?",
-        "I am still here if you want a command.",
-        "You can talk to me normally or use /help.",
-        "I saved your session in the log.",
-    ]
-    while not stop_event.wait(random.randint(35, 70)):
-        if stop_event.is_set() or shutting_down:
+    for pattern, responses in local_conversation.items():
+        if pattern in lower_text:
+            generic_reply = random.choice(responses)
+            category_type = "generic"
+            matched_local = True
             break
-        speak(maybe_address_user(random.choice(messages), chance=0.18), allow_sound=True)
+
+    if not matched_local:
+        try:
+            import os
+            api_key = "API_KEY_HERE" # Replace with your actual API key
+
+            if api_key:
+                messages_payload = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are SOAR (Script Optimization and Automation Runtime), an advanced, intelligent local desktop AI assistant "
+                            "created by Philip Kluz. You are running on a Mac/Windows. You are a custom automated runtime helper built with pure Python.\n\n"
+                            "Your current system specifications and architectural capabilities include:\n"
+                            "- Version: 1.00.4 Early Beta.\n"
+                            "- AVSS (Advanced Vulnerability & Security Shield): A localized, active protection shield running on a daemon thread monitoring background processes and providing security hardening.\n"
+                            "- File & Workspace Access: You directly manage folders and track local assets under the root directory 'soar_data' containing local tracking structures (notes.txt, memories.txt, todos.txt, chat_log.txt), and the user's primary project space at '~/SOAR/Projects'.\n"
+                        )
+                    }
+                ]
+
+                try:
+                    log_path = os.path.join(os.path.dirname(__file__), "soar_data", "chat_log.txt")
+                    if os.path.exists(log_path):
+                        with open(log_path, "r", encoding="utf-8") as f:
+                            lines = f.readlines()
+                        
+                        recent_lines = [line.strip() for line in lines[-12:] if line.strip()]
+                        
+                        for line in recent_lines:
+                            if "USER:" in line:
+                                clean_content = line.split("USER:")[-1].strip()
+                                if clean_content:
+                                    messages_payload.append({"role": "user", "content": clean_content})
+                            elif "SOAR:" in line:
+                                clean_content = line.split("SOAR:")[-1].strip()
+                                if clean_content:
+                                    messages_payload.append({"role": "assistant", "content": clean_content})
+                except Exception as log_err:
+                    print("[SOAR AI] Could not read chat_log.txt:", log_err)
+
+                messages_payload.append({"role": "user", "content": text})
+
+                payload = {
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": messages_payload,
+                    "temperature": 0.7,
+                    "max_tokens": 200
+                }
+
+                req = urllib.request.Request(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    },
+                    method="POST"
+                )
+
+                ctx = ssl_context if 'ssl_context' in locals() or 'ssl_context' in globals() else None
+
+                with urllib.request.urlopen(req, context=ctx, timeout=10) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+                    reply = data["choices"][0]["message"]["content"].strip()
+
+                    if reply:
+                        generic_reply = reply
+                        category_type = "generic"
+            else:
+                print("[SOAR AI] Skipped Groq: GROQ_API_KEY environment variable not set.")
+
+        except urllib.error.HTTPError as e:
+            print("HTTP ERROR CODE:", e.code)
+            print("RESPONSE:", e.read().decode())          
+
+        except Exception as e:
+            print("Groq Error:", e)
+
+    if not generic_reply:
+        generic_reply = "I'm online, sir. Let me know what you need."
+
+    final_reply = apply_personality_traits(generic_reply, category_type)
+    return maybe_address_user(final_reply)
 
 
 
@@ -2540,9 +2732,7 @@ def start_voice_listener():
                         daemon=True,
                     ).start()
             except sr.UnknownValueError:
-                print(".", end="", flush=True)
-            except sr.RequestError as e:
-                print(f"\n[VOICE ERROR] Google Speech API connection failed: {e}")
+                print("", end="", flush=True)
             except Exception as e:
                 print(f"\n[VOICE CALLBACK ERROR] {e}")
 
@@ -2553,7 +2743,6 @@ def start_voice_listener():
                 return False
             
             listener_stop = recognizer.listen_in_background(mic, callback, phrase_time_limit=4)
-            print("[SOAR] Voice engine is actively listening in background.")
         finally:
             if acquired:
                 try:
@@ -3046,13 +3235,11 @@ def process_command(raw, from_voice=False):
 
             issues = []
 
-            # 1. Syntax Validation
             try:
                 compile(code_text, file_path.name, "exec")
             except SyntaxError as syntax_err:
                 issues.append(f"[CRITICAL SYNTAX ERROR] Line {start_idx + syntax_err.lineno}: {syntax_err.msg}\n  -> Fix: Adjust syntax structure near token '{syntax_err.text.strip() if syntax_err.text else ''}'")
 
-            # 2. Diagnostic Heuristics
             def check_silent_exceptions(t_lines, s_idx, all_lines):
                 found = []
                 for idx, line in enumerate(t_lines, start=s_idx + 1):
@@ -3110,7 +3297,6 @@ def process_command(raw, from_voice=False):
                 confirm = input("> ").strip()
                 
                 if confirm.lower() == "proceed":
-                    # --- AUTOMATED BACKUP PROTOCOL ---
                     backup_file = file_path.with_name(f"{file_path.stem}_backup{file_path.suffix}")
                     try:
                         shutil.copy2(file_path, backup_file)
@@ -3132,7 +3318,6 @@ def process_command(raw, from_voice=False):
 
                             def visit_Module(self, node):
                                 self.generic_visit(node)
-                                # Inject required imports at the top of the file
                                 if self.required_imports:
                                     import_nodes = [ast.Import(names=[ast.alias(name=mod, asname=None)]) for mod in self.required_imports]
                                     node.body = import_nodes + node.body
@@ -3140,7 +3325,6 @@ def process_command(raw, from_voice=False):
 
                             def visit_Call(self, node):
                                 self.generic_visit(node)
-                                # Safe fix for eval() -> ast.literal_eval()
                                 if isinstance(node.func, ast.Name) and node.func.id == 'eval':
                                     self.required_imports.add('ast')
                                     node.func = ast.Attribute(
@@ -3153,14 +3337,12 @@ def process_command(raw, from_voice=False):
 
                             def visit_Try(self, node):
                                 self.generic_visit(node)
-                                # Fix silent except: pass without breaking flow
                                 for handler in node.handlers:
                                     if len(handler.body) == 1 and isinstance(handler.body[0], ast.Pass):
                                         handler.type = ast.Name(id='Exception', ctx=ast.Load())
                                         handler.name = 'e'
                                         log_msg = "Exception handled structurally via SOAR wrapper: "
                                         
-                                        # print(f"Msg {e}")
                                         new_log_node = ast.Expr(
                                             value=ast.Call(
                                                 func=ast.Name(id='print', ctx=ast.Load()),
@@ -3181,18 +3363,15 @@ def process_command(raw, from_voice=False):
                                 
                                 self.generic_visit(node)
                                 
-                                # Safe Mutable Default Fix: Changes def f(x=[]) to def f(x=None) + if x is None: x = []
                                 injected_body = []
                                 if node.args.defaults:
                                     new_defaults = []
-                                    # Align arguments with their defaults (defaults apply to the last N arguments)
                                     args_with_defaults = node.args.args[-len(node.args.defaults):]
                                     
                                     for arg, default in zip(args_with_defaults, node.args.defaults):
                                         if isinstance(default, (ast.List, ast.Dict)):
                                             new_defaults.append(ast.Constant(value=None))
                                             
-                                            # Create: if arg is None: arg = []
                                             test = ast.Compare(
                                                 left=ast.Name(id=arg.arg, ctx=ast.Load()),
                                                 ops=[ast.Is()],
@@ -3208,11 +3387,9 @@ def process_command(raw, from_voice=False):
                                             new_defaults.append(default)
                                     node.args.defaults = new_defaults
                                 
-                                # Prepend any injected default handlers to the function body
                                 if injected_body:
                                     node.body = injected_body + node.body
                                 
-                                # Fix dead code after returns/breaks
                                 new_body = []
                                 term_found = False
                                 for expr in node.body:
@@ -3228,7 +3405,6 @@ def process_command(raw, from_voice=False):
 
                             def visit_While(self, node):
                                 self.generic_visit(node)
-                                # Infinite loop guard
                                 if isinstance(node.test, ast.Constant) and node.test.value is True:
                                     has_break = any(isinstance(sub, (ast.Break, ast.Return, ast.Raise)) for sub in ast.walk(node))
                                     if not has_break:
@@ -3240,7 +3416,6 @@ def process_command(raw, from_voice=False):
                         modified_tree = transformer.visit(tree)
                         ast.fix_missing_locations(modified_tree)
                         
-                        # ast.unparse requires Python 3.9+
                         if hasattr(ast, 'unparse'):
                             rebuilt_code = ast.unparse(modified_tree)
                         else:
@@ -4043,7 +4218,7 @@ def main():
     print("Voice starts automatically if your mic libraries are ready.\n")
 
     try:
-        speak("SOAR Booted, version 1.00.3. Voice is on.", allow_sound=True)
+        speak("SOAR Booted, version 1.00.4. Voice is on.", allow_sound=True)
     except Exception:
         pass
 
